@@ -383,11 +383,11 @@ Update `FRONTEND_URL` and `BACKEND_PUBLIC_URL` on Railway to match the deployed 
 
 ##  Live Application
 
-**Frontend (Vercel):** Add your deployed frontend URL here.
+**Frontend (Vercel):** http://localhost:5173,https://paylink-mpesa-ohk7.vercel.app
 
-**Backend (Railway):** Add your deployed backend URL here.
+**Backend (Railway):** https://paylink-mpesa-production.up.railway.app
 
-**GitHub Repository:** Add your repository URL here.
+**GitHub Repository:** https://github.com/Dominic-kores/paylink-mpesa
 
 ## Security Considerations
 
