@@ -1,5 +1,30 @@
 
-# PayLink v1 — M-Pesa Payment Link Generator
+# PayLink v2 — M-Pesa Payment Link Generator
+
+## What's New in v2
+
+v1 worked, but the payer stared at a spinner and the merchant had to check the dashboard to find out if anything came in. v2 makes the system feel alive:
+
+| Feature | How it works |
+|---------|--------------|
+| **Real-time payment status** | The payer page connects over Socket.IO and moves through *Waiting for payment → Processing → Payment received* the moment the M-Pesa callback lands. No refresh. |
+| **Email receipt** | On success the payer gets a formatted receipt via **Resend**: amount, merchant name, M-Pesa receipt number and date. |
+| **Merchant SMS** | The merchant gets *"PayLink: Payment of KES 2,500 received from 0712345678."* via **Africa's Talking**. |
+| **Notification bell** | Signed-in dashboards receive live notifications over an authenticated socket. A toast pops up and the bell badge count increases. |
+| **Payment analytics** | Total received, payment count, average payment and a bar chart of the last 7 days (grouped by Nairobi time). Updates live when a payment arrives. |
+
+### v2 design notes
+
+The code follows the Week 10 project steps (Socket.IO server with `payerSockets` / `merchantSockets`, the 4-step callback handler, `PaymentPage.jsx`, `routes/analytics.js`, the notification service). PayLink v1 has a single merchant account and ES modules, so a few things are adapted:
+
+- **The merchant is the admin account.** Merchant name and phone come from `MERCHANT_NAME` / `MERCHANT_PHONE`, and notifications use `userId = "admin"`.
+- **`register-merchant` sends the login token, not a user id**, and the server verifies it. Otherwise anyone could subscribe to the merchant's payment notifications. Analytics and notifications use the same JWT check instead of an `x-user-id` header.
+- **Socket maps hold a set of socket ids per key**, so two customers on the same link (or two dashboard tabs) don't overwrite each other. Each `payment-status` carries a `paymentId`, and a browser only reacts to its own payment.
+- **No duplicate notifications.** The callback only saves a receipt once (`mpesaReceiptNumber: null` guard), and email, SMS and notification are only sent when that update succeeds.
+- **The callback keeps v1's protections:** a secret token in the callback URL, plus checks that the amount and phone match the pending payment.
+- **Fallback poll.** The payer page polls every 10s while waiting, which triggers the Daraja status query when a sandbox callback never arrives.
+- **Email and SMS are optional.** If their keys are not set they are skipped with a log line, and payments still work.
+
 
 ## Project Overview
 
@@ -75,7 +100,9 @@ The main objectives are to:
 | Payment Gateway | Safaricom Daraja API |
 | Authentication | JWT, bcrypt |
 | QR Codes | qrcode.react |
-| Email | Nodemailer |
+| Real-time | Socket.IO |
+| Email | Resend |
+| SMS | Africa's Talking |
 | API Testing | Thunder Client |
 | Callback Testing | ngrok |
 | Deployment | Railway, Vercel |
@@ -93,18 +120,37 @@ paylink-mpesa/
 │   │   ├── mpesa.js
 │   │   ├── prisma.js
 │   │   ├── auth.js
-│   │   └── email.js
+│   │   ├── middleware.js
+│   │   ├── utils.js
+│   │   ├── routes/
+│   │   │   ├── payments.js        # STK push + callback (v2)
+│   │   │   ├── analytics.js       # (v2)
+│   │   │   └── notifications.js   # (v2)
+│   │   ├── services/
+│   │   │   ├── emailService.js        # Resend (v2)
+│   │   │   ├── smsService.js          # Africa's Talking (v2)
+│   │   │   └── notificationService.js # (v2)
+│   │   ├── emails/
+│   │   │   └── paymentReceipt.js  # (v2)
+│   │   └── sms/
+│   │       └── templates.js       # (v2)
 │   ├── .env.example
 │   └── package.json
 │
 ├── client/
 │   ├── src/
 │   │   ├── components/
-│   │   │   └── UI.jsx
+│   │   │   ├── UI.jsx
+│   │   │   ├── NotificationBell.jsx   (v2)
+│   │   │   ├── ToastNotification.jsx  (v2)
+│   │   │   └── PaymentsChart.jsx      (v2)
+│   │   ├── context/
+│   │   │   └── NotificationContext.jsx (v2)
+│   │   ├── socket.js                   (v2)
 │   │   ├── pages/
 │   │   │   ├── Create.jsx
 │   │   │   ├── Dashboard.jsx
-│   │   │   ├── Pay.jsx
+│   │   │   ├── PaymentPage.jsx   (v2, was Pay.jsx)
 │   │   │   └── Payments.jsx
 │   │   ├── api.js
 │   │   ├── App.jsx
@@ -174,7 +220,22 @@ DARAJA_PASSKEY=your_passkey
 BACKEND_PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
 
 MPESA_CALLBACK_TOKEN=your_random_callback_token
+
+# v2: merchant details
+MERCHANT_NAME="Your Business Name"
+MERCHANT_PHONE=0712345678
+
+# v2: Resend email receipts (optional)
+RESEND_API_KEY=re_your_api_key
+EMAIL_FROM="PayLink <receipts@your-verified-domain.com>"
+
+# v2: Africa's Talking SMS (optional; "sandbox" uses the AT sandbox)
+AT_USERNAME=sandbox
+AT_API_KEY=your_africastalking_api_key
+AT_SENDER_ID=
 ```
+
+With `AT_USERNAME=sandbox`, SMS messages appear in the Africa's Talking sandbox simulator rather than on a real phone. With Resend's test sender (`onboarding@resend.dev`), you can only email your own Resend account address until you verify a domain.
 
 Use strong, randomly generated secrets and store a bcrypt hash of the administrator password.
 
@@ -183,10 +244,12 @@ Use strong, randomly generated secrets and store a bcrypt hash of the administra
 Run Prisma migrations:
 
 ```bash
-npx prisma migrate dev --name init
+npx prisma migrate dev
 
 npx prisma generate
 ```
+
+Upgrading an existing v1 database? Run `npx prisma migrate deploy`. The `paylink_v2` migration adds `payerEmail` and `paidAt` to `Payment` and creates the `Notification` table. It backfills `paidAt` for existing completed payments so they appear in analytics.
 
 Optional: Open Prisma Studio to inspect the database.
 
@@ -265,14 +328,28 @@ Restart the backend after updating environment variables.
 | GET | `/api/links` | Retrieve merchant links |
 | GET | `/api/links/:slug` | Get payment link details |
 | PATCH | `/api/links/:id/toggle` | Activate/deactivate a link |
-| POST | `/api/mpesa/stkpush` | Initiate STK Push |
+| POST | `/api/payments/initiate` | Initiate STK Push: `{ paymentLinkId, phone, email }` (v2) |
+| POST | `/api/mpesa/stkpush` | Initiate STK Push (v1 alias) |
 | POST | `/api/mpesa/callback` | Receive M-Pesa callback |
 | GET | `/api/payments/:id/poll` | Check payment status |
 | GET | `/api/payments` | Transaction history |
 | GET | `/api/links/:id/payments.csv` | Export payment history |
 | GET | `/api/health` | Health check |
+| GET | `/api/analytics` | Totals + last-7-days chart data (v2) |
+| GET | `/api/notifications` | Latest 20 notifications + unread count (v2) |
+| PATCH | `/api/notifications/:id/read` | Mark one notification read (v2) |
+| PATCH | `/api/notifications/read-all` | Mark all notifications read (v2) |
 
 Merchant management endpoints require a JWT Bearer token.
+
+### WebSocket events (v2)
+
+| Direction | Event | Payload |
+|-----------|-------|---------|
+| payer → server | `watch-payment` | `paymentLinkId` |
+| merchant → server | `register-merchant` | The dashboard JWT. Invalid tokens get `register-error`. |
+| server → payer | `payment-status` | `{ paymentId, status: "processing" \| "completed" \| "failed", amount, mpesaReceiptNumber, reason, paidAt }` |
+| server → merchant | `notification` | A saved `Notification` row |
 
 ## Example API Requests
 
@@ -301,7 +378,8 @@ http://localhost:5173/pay/logo-design
 ```json
 {
   "linkSlug": "logo-design",
-  "phoneNumber": "0712345678"
+  "phoneNumber": "0712345678",
+  "email": "customer@example.com"
 }
 ```
 
@@ -330,7 +408,12 @@ An accepted STK Push request does not automatically mean the payment succeeded.
 7. The customer approves or cancels the payment on their phone.
 8. Safaricom sends the transaction result to the callback endpoint.
 9. The application updates the payment record.
-10. The frontend displays the payment result, and the dashboard reflects confirmed collections.
+10. In parallel, the server:
+    - **WebSocket:** pushes the result to the payer's browser, which updates live.
+    - **Email:** sends a formatted receipt to the payer (if they gave an email).
+    - **SMS:** texts the merchant "Payment of KES X received from 07…".
+    - **Notification:** saves a notification and pushes it to open dashboards (toast + bell badge).
+11. The merchant dashboard refreshes its stats and 7-day chart immediately.
 
 ## Testing
 

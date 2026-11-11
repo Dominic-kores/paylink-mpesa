@@ -14,11 +14,14 @@ import {
 import { api } from "./api.js";
 
 import { Alert } from "./components/UI.jsx";
+import NotificationBell from "./components/NotificationBell.jsx";
+import ToastNotification from "./components/ToastNotification.jsx";
+import { NotificationProvider } from "./context/NotificationContext.jsx";
 
 import Create from "./pages/Create.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import Payments from "./pages/Payments.jsx";
-import Pay from "./pages/Pay.jsx";
+import PaymentPage from "./pages/PaymentPage.jsx";
 
 // --------------------------------------------------
 // Login component
@@ -156,7 +159,7 @@ export default function App() {
         : "text-slate-600 hover:bg-slate-100"
     }`;
 
-  return (
+  const page = (
     <div className="min-h-screen">
       {/* Header */}
       <header className="border-b border-slate-200 bg-white">
@@ -199,6 +202,8 @@ export default function App() {
                 </NavLink>
               </>
             )}
+
+            {token && <NotificationBell />}
 
             {token ? (
               <button
@@ -296,7 +301,7 @@ export default function App() {
           {/* Public customer payment page */}
           <Route
             path="/pay/:slug"
-            element={<Pay />}
+            element={<PaymentPage />}
           />
 
           {/* 404 page */}
@@ -322,9 +327,20 @@ export default function App() {
 
       {/* Footer */}
       <footer className="mt-12 border-t border-slate-200 py-6 text-center text-xs text-slate-500">
-        PayLink v1 • M-Pesa via Daraja •
+        PayLink v2 • M-Pesa via Daraja •
         Training project
       </footer>
     </div>
+  );
+
+  // Signed-in merchants get live notifications + toasts.
+  // key={token} gives a fresh socket per session.
+  return token ? (
+    <NotificationProvider key={token} token={token}>
+      {page}
+      <ToastNotification />
+    </NotificationProvider>
+  ) : (
+    page
   );
 }

@@ -56,3 +56,26 @@
     @apply font-semibold text-emerald-700 hover:underline;
   }
 }
+/* PayLink v2: toast + live status animations */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.toast-in {
+  animation: toast-in 0.25s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-in,
+  .animate-ping,
+  .animate-spin {
+    animation: none;
+  }
+}
