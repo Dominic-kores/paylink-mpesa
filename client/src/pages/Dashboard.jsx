@@ -18,6 +18,70 @@ import {
   QR,
 } from "../components/UI.jsx";
 
+import PaymentsChart from "../components/PaymentsChart.jsx";
+
+import { useNotifications } from "../context/NotificationContext.jsx";
+
+// Payment analytics: stats cards + 7-day chart.
+// Refetches whenever a live payment notification arrives.
+function DashboardContent({ token }) {
+  const [analytics, setAnalytics] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const { revision } = useNotifications();
+
+  useEffect(() => {
+    async function fetchAnalytics() {
+      try {
+        const data = await api("/api/analytics", { token });
+        setAnalytics(data);
+      } catch (err) {
+        console.error("Failed to fetch analytics:", err);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchAnalytics();
+  }, [token, revision]);
+
+  if (loading) return <p className="mt-6">Loading dashboard...</p>;
+
+  const totalReceived = analytics?.totalReceived || 0;
+  const totalPayments = analytics?.totalPayments || 0;
+
+  return (
+    <div>
+      {/* Stats Cards */}
+      <div className="mt-6 grid gap-4 md:grid-cols-3">
+        {[
+          ["Total Received", money(totalReceived)],
+          ["Total Payments", totalPayments],
+          [
+            "Average Payment",
+            money(
+              totalPayments
+                ? Math.round(totalReceived / totalPayments)
+                : 0
+            ),
+          ],
+        ].map(([label, value]) => (
+          <div key={label} className="card">
+            <p className="muted text-sm">{label}</p>
+            <p className="mt-2 text-2xl font-extrabold">{value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Bar Chart */}
+      {analytics && (
+        <div className="mt-4">
+          <PaymentsChart data={analytics.chartData} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Dashboard({ token }) {
   const [links, setLinks] = useState([]);
 
@@ -27,12 +91,13 @@ export default function Dashboard({ token }) {
 
   const [workingId, setWorkingId] = useState("");
 
+  // Changes whenever a live payment notification arrives
+  const { revision } = useNotifications();
+
   // Fetch payment links from the backend
   async function load() {
     try {
-      const data = await api("/api/links", {
-        token,
-      });
+      const data = await api("/api/links", { token });
 
       setLinks(data);
       setError("");
@@ -43,9 +108,11 @@ export default function Dashboard({ token }) {
     }
   }
 
+  // Reload on sign-in and on every live payment, so the
+  // per-link totals update without a page refresh.
   useEffect(() => {
     load();
-  }, [token]);
+  }, [token, revision]);
 
   // Activate or deactivate a payment link
   async function toggle(id) {
@@ -78,19 +145,6 @@ export default function Dashboard({ token }) {
     }
   }
 
-  // Calculate overall dashboard statistics
-  const payments = links.reduce(
-    (total, link) =>
-      total + link.completedPayments,
-    0
-  );
-
-  const collected = links.reduce(
-    (total, link) =>
-      total + link.totalCollected,
-    0
-  );
-
   return (
     <div>
       {/* Dashboard header */}
@@ -119,27 +173,8 @@ export default function Dashboard({ token }) {
         </div>
       )}
 
-      {/* Summary statistics */}
-      <div className="mt-6 grid gap-4 md:grid-cols-3">
-        {[
-          ["Total links", links.length],
-          ["Completed payments", payments],
-          ["Total collected", money(collected)],
-        ].map(([label, value]) => (
-          <div
-            key={label}
-            className="card"
-          >
-            <p className="muted text-sm">
-              {label}
-            </p>
-
-            <p className="mt-2 text-2xl font-extrabold">
-              {value}
-            </p>
-          </div>
-        ))}
-      </div>
+      {/* Payment analytics */}
+      <DashboardContent token={token} />
 
       <h2 className="mt-9 text-xl font-bold">
         Payment links

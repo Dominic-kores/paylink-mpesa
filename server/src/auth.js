@@ -1,6 +1,10 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
+// PayLink has a single merchant account (the admin), so
+// notifications and sockets are keyed by this id.
+export const MERCHANT_ID = "admin";
+
 // Login using the administrator's password
 export async function login(req, res) {
   const password = req.body?.password;
@@ -40,6 +44,21 @@ export async function login(req, res) {
   return res.json({ token });
 }
 
+// Verify a dashboard JWT. Throws if it is invalid.
+// Shared by the REST middleware and the Socket.IO handshake.
+export function verifyAdminToken(token) {
+  const payload = jwt.verify(token, process.env.JWT_SECRET, {
+    issuer: "paylink",
+    audience: "paylink-dashboard",
+  });
+
+  if (payload.role !== "admin") {
+    throw new Error("Invalid role");
+  }
+
+  return payload;
+}
+
 // Middleware for protecting private API routes
 export function requireAdmin(req, res, next) {
   const header = req.get("authorization") || "";
@@ -51,18 +70,9 @@ export function requireAdmin(req, res, next) {
   }
 
   try {
-    const payload = jwt.verify(
-      header.slice(7),
-      process.env.JWT_SECRET,
-      {
-        issuer: "paylink",
-        audience: "paylink-dashboard",
-      }
-    );
+    verifyAdminToken(header.slice(7));
 
-    if (payload.role !== "admin") {
-      throw new Error("Invalid role");
-    }
+    req.userId = MERCHANT_ID;
 
     next();
   } catch {

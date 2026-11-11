@@ -37,8 +37,25 @@ model Payment {
   resultDesc         String?
   mpesaReceiptNumber String?
   transactionDate    String?
+  payerEmail         String?
+  paidAt             DateTime?
   paymentLink        PaymentLink? @relation(fields: [paymentLinkId], references: [id])
   paymentLinkId      String?
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
+
+  @@index([status, paidAt])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String
+  title     String
+  message   String
+  data      Json?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, read, createdAt])
 }

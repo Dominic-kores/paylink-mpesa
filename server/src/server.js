@@ -1,27 +1,31 @@
 import "dotenv/config";
 
+import http from "node:http";
+
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import { Server } from "socket.io";
 
-import {
-  randomBytes,
-  timingSafeEqual,
-} from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 import { z } from "zod";
 
 import { prisma } from "./prisma.js";
-import { login, requireAdmin } from "./auth.js";
-
 import {
-  formatPhone,
-  sendSTK,
-  querySTK,
-} from "./mpesa.js";
+  login,
+  requireAdmin,
+  verifyAdminToken,
+  MERCHANT_ID,
+} from "./auth.js";
 
-import { sendPaymentEmail } from "./email.js";
+import { wrap, limiter } from "./middleware.js";
+import { maskPhone } from "./utils.js";
+
+import paymentsRouter from "./routes/payments.js";
+import analyticsRouter from "./routes/analytics.js";
+import notificationsRouter from "./routes/notifications.js";
+import notificationService from "./services/notificationService.js";
 
 // --------------------------------------------------
 // 1. Validate required environment variables
@@ -83,19 +87,6 @@ app.use("/api", (_req, res, next) => {
   next();
 });
 
-// Forward asynchronous errors to Express
-const wrap = (fn) => (req, res, next) =>
-  Promise.resolve(fn(req, res, next)).catch(next);
-
-// Basic rate limiting
-const limiter = (max) =>
-  rateLimit({
-    windowMs: 10 * 60 * 1000,
-    limit: max,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-  });
-
 // --------------------------------------------------
 // 3. Input validation and response helpers
 // --------------------------------------------------
@@ -128,21 +119,8 @@ const publicLink = (link) => ({
   amount: link.amount,
   description: link.description,
   active: link.active,
+  merchantName: process.env.MERCHANT_NAME || "PayLink Merchant",
   createdAt: link.createdAt,
-});
-
-// Mask the customer's phone number
-const maskPhone = (phone) =>
-  `${phone.slice(0, 4)}****${phone.slice(-4)}`;
-
-// Return payment details without exposing full phone
-const publicPayment = (payment) => ({
-  id: payment.id,
-  status: payment.status,
-  amount: payment.amount,
-  resultDesc: payment.resultDesc,
-  receipt: payment.mpesaReceiptNumber,
-  createdAt: payment.createdAt,
 });
 
 // --------------------------------------------------
@@ -343,60 +321,7 @@ app.patch(
 );
 
 // --------------------------------------------------
-// 9. Transaction history with status filtering
-// GET /api/payments
-// --------------------------------------------------
-
-app.get(
-  "/api/payments",
-  requireAdmin,
-  wrap(async (req, res) => {
-    const status = req.query.status;
-
-    if (
-      status &&
-      !["pending", "completed", "failed"].includes(status)
-    ) {
-      return res.status(400).json({
-        error: "Invalid payment status filter",
-      });
-    }
-
-    const payments = await prisma.payment.findMany({
-      where: status ? { status } : {},
-
-      orderBy: {
-        createdAt: "desc",
-      },
-
-      take: 500,
-
-      include: {
-        paymentLink: {
-          select: {
-            slug: true,
-            description: true,
-          },
-        },
-      },
-    });
-
-    const results = payments.map((payment) => ({
-      ...publicPayment(payment),
-
-      phoneNumber: maskPhone(payment.phoneNumber),
-
-      paymentLink: payment.paymentLink,
-
-      transactionDate: payment.transactionDate,
-    }));
-
-    res.json(results);
-  })
-);
-
-// --------------------------------------------------
-// 10. Download payments for a link as CSV
+// 9. Download payments for a link as CSV
 // GET /api/links/:id/payments.csv
 // --------------------------------------------------
 
@@ -473,369 +398,15 @@ app.get(
 );
 
 // --------------------------------------------------
-// 11. Initiate STK Push
-// POST /api/mpesa/stkpush
+// 10. Payments, analytics and notifications (v2)
 // --------------------------------------------------
 
-app.post(
-  "/api/mpesa/stkpush",
-  limiter(10),
-  wrap(async (req, res) => {
-    const { linkSlug, phoneNumber } = req.body || {};
-
-    if (typeof linkSlug !== "string") {
-      return res.status(400).json({
-        error: "linkSlug required",
-      });
-    }
-
-    let phone;
-
-    try {
-      phone = formatPhone(phoneNumber);
-    } catch (err) {
-      return res.status(400).json({
-        error: err.message,
-      });
-    }
-
-    // Read amount from the database, not the frontend
-    const link = await prisma.paymentLink.findUnique({
-      where: {
-        slug: linkSlug,
-      },
-    });
-
-    if (!link) {
-      return res.status(404).json({
-        error: "Payment link not found",
-      });
-    }
-
-    if (!link.active) {
-      return res.status(410).json({
-        error: "This payment link is no longer active",
-      });
-    }
-
-    // Request Safaricom to send the payment prompt
-    const response = await sendSTK({
-      phone,
-      amount: link.amount,
-      slug: link.slug,
-      description: link.description,
-    });
-
-    // ResponseCode 0 means the request was accepted.
-    // It does NOT mean payment was completed.
-    if (
-      String(response.ResponseCode) !== "0" ||
-      !response.CheckoutRequestID
-    ) {
-      return res.status(502).json({
-        error:
-          response.ResponseDescription ||
-          "STK request was not accepted",
-      });
-    }
-
-    // Save a pending transaction
-    const payment = await prisma.payment.create({
-      data: {
-        checkoutRequestId: response.CheckoutRequestID,
-
-        merchantRequestId:
-          response.MerchantRequestID || null,
-
-        phoneNumber: phone,
-        amount: link.amount,
-
-        paymentLinkId: link.id,
-
-        accountReference: link.slug.slice(0, 12),
-
-        transactionDesc: link.description,
-
-        status: "pending",
-      },
-    });
-
-    res.status(202).json({
-      paymentId: payment.id,
-      status: payment.status,
-      message:
-        "Check your phone and enter your M-Pesa PIN.",
-    });
-  })
-);
+app.use("/api", paymentsRouter);
+app.use("/api", analyticsRouter);
+app.use("/api", notificationsRouter);
 
 // --------------------------------------------------
-// 12. Validate callback token
-// --------------------------------------------------
-
-function checkCallbackToken(token) {
-  const expected = process.env.MPESA_CALLBACK_TOKEN;
-
-  if (
-    !expected ||
-    typeof token !== "string" ||
-    expected.length !== token.length
-  ) {
-    return false;
-  }
-
-  return timingSafeEqual(
-    Buffer.from(expected),
-    Buffer.from(token)
-  );
-}
-
-const sleep = (ms) =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-// --------------------------------------------------
-// 13. Safaricom callback endpoint
-// POST /api/mpesa/callback
-// --------------------------------------------------
-
-app.post(
-  "/api/mpesa/callback",
-  wrap(async (req, res) => {
-    if (!checkCallbackToken(req.query.token)) {
-      return res.status(403).json({
-        error: "Forbidden",
-      });
-    }
-
-    const callback = req.body?.Body?.stkCallback;
-
-    if (
-      !callback ||
-      typeof callback.CheckoutRequestID !== "string" ||
-      !Number.isInteger(Number(callback.ResultCode))
-    ) {
-      return res.status(400).json({
-        error: "Malformed callback",
-      });
-    }
-
-    let payment;
-
-    // Retry briefly if callback arrives before
-    // the initial transaction is fully saved.
-    for (let i = 0; i < 4; i++) {
-      payment = await prisma.payment.findUnique({
-        where: {
-          checkoutRequestId:
-            callback.CheckoutRequestID,
-        },
-      });
-
-      if (payment) break;
-
-      await sleep(500);
-    }
-
-    if (!payment) {
-      return res.status(503).json({
-        error: "Checkout not recorded yet",
-      });
-    }
-
-    const code = Number(callback.ResultCode);
-
-    const metadata = Object.fromEntries(
-      (callback.CallbackMetadata?.Item || [])
-        .filter(
-          (item) =>
-            item && typeof item.Name === "string"
-        )
-        .map((item) => [item.Name, item.Value])
-    );
-
-    // SUCCESSFUL PAYMENT
-    if (code === 0) {
-      const callbackPhone = String(
-        metadata.PhoneNumber ?? ""
-      );
-
-      const receipt = String(
-        metadata.MpesaReceiptNumber ?? ""
-      );
-
-      // Validate the returned payment details
-      if (
-        Number(metadata.Amount) !== payment.amount ||
-        callbackPhone !== payment.phoneNumber ||
-        !receipt
-      ) {
-        return res.status(422).json({
-          error:
-            "Payment success details could not be verified",
-        });
-      }
-
-      // Update only if a receipt has not already
-      // been saved; protects against duplicate callbacks.
-      const result = await prisma.payment.updateMany({
-        where: {
-          id: payment.id,
-          mpesaReceiptNumber: null,
-          status: {
-            in: ["pending", "completed"],
-          },
-        },
-
-        data: {
-          status: "completed",
-          resultCode: 0,
-
-          resultDesc: String(
-            callback.ResultDesc || "Payment successful"
-          ),
-
-          mpesaReceiptNumber: receipt,
-
-          transactionDate: String(
-            metadata.TransactionDate || ""
-          ),
-        },
-      });
-
-      // Optional notification, only on first
-      // successful receipt update.
-      if (result.count) {
-        const updated = await prisma.payment.findUnique({
-          where: {
-            id: payment.id,
-          },
-        });
-
-        sendPaymentEmail(updated).catch((err) => {
-          console.error(
-            "Optional email could not be sent:",
-            err.message
-          );
-        });
-      }
-    } else {
-      // FAILED OR CANCELLED PAYMENT
-      await prisma.payment.updateMany({
-        where: {
-          id: payment.id,
-          status: "pending",
-        },
-
-        data: {
-          status: "failed",
-          resultCode: code,
-
-          resultDesc: String(
-            callback.ResultDesc ||
-              "Payment not completed"
-          ),
-        },
-      });
-    }
-
-    res.json({
-      ResultCode: 0,
-      ResultDesc: "Accepted",
-    });
-  })
-);
-
-// --------------------------------------------------
-// 14. Poll payment status
-// GET /api/payments/:id/poll
-// --------------------------------------------------
-
-const lastQueried = new Map();
-
-app.get(
-  "/api/payments/:id/poll",
-  limiter(100),
-  wrap(async (req, res) => {
-    let payment = await prisma.payment.findUnique({
-      where: {
-        id: req.params.id,
-      },
-    });
-
-    if (!payment) {
-      return res.status(404).json({
-        error: "Payment not found",
-      });
-    }
-
-    const age =
-      Date.now() - payment.createdAt.getTime();
-
-    const last = lastQueried.get(payment.id) || 0;
-
-    // Ask Daraja if the payment is still pending
-    // and the callback has not arrived.
-    if (
-      payment.status === "pending" &&
-      age > 20000 &&
-      Date.now() - last > 20000
-    ) {
-      lastQueried.set(payment.id, Date.now());
-
-      try {
-        const check = await querySTK(
-          payment.checkoutRequestId
-        );
-
-        if (
-          check?.ResultCode !== undefined &&
-          check?.ResultCode !== null
-        ) {
-          const code = Number(check.ResultCode);
-
-          if (Number.isInteger(code)) {
-            await prisma.payment.updateMany({
-              where: {
-                id: payment.id,
-                status: "pending",
-              },
-
-              data: {
-                status:
-                  code === 0 ? "completed" : "failed",
-
-                resultCode: code,
-
-                resultDesc: String(
-                  check.ResultDesc ||
-                    "M-Pesa status query result"
-                ),
-              },
-            });
-          }
-        }
-      } catch (err) {
-        console.warn(
-          "STK query pending:",
-          err.response?.data?.errorMessage ||
-            err.message
-        );
-      }
-    }
-
-    // Fetch the latest status after reconciliation
-    payment = await prisma.payment.findUnique({
-      where: {
-        id: req.params.id,
-      },
-    });
-
-    res.json(publicPayment(payment));
-  })
-);
-
-// --------------------------------------------------
-// 15. Global error handling
+// 11. Global error handling
 // --------------------------------------------------
 
 app.use((err, _req, res, _next) => {
@@ -874,13 +445,91 @@ app.use((err, _req, res, _next) => {
 });
 
 // --------------------------------------------------
-// 16. Start Express server
+// 12. Socket.IO: real-time payment status + notifications
+// --------------------------------------------------
+
+// Replace app.listen() with this:
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
+  },
+});
+
+// Track payer connections: { paymentLinkId: Set<socketId> }
+// A Set (not a single id) so two customers on the same link,
+// or two tabs, do not overwrite each other.
+const payerSockets = new Map();
+
+// Track merchant connections: { userId: Set<socketId> }
+const merchantSockets = new Map();
+
+const addSocket = (map, key, socketId) => {
+  if (!map.has(key)) map.set(key, new Set());
+  map.get(key).add(socketId);
+};
+
+const removeSocket = (map, key, socketId) => {
+  map.get(key)?.delete(socketId);
+  if (map.get(key)?.size === 0) map.delete(key);
+};
+
+io.on("connection", (socket) => {
+  // Payer watches a specific payment link
+  socket.on("watch-payment", (paymentLinkId) => {
+    if (typeof paymentLinkId !== "string" || paymentLinkId.length > 64) {
+      return;
+    }
+
+    if (socket.paymentLinkId) {
+      removeSocket(payerSockets, socket.paymentLinkId, socket.id);
+    }
+
+    addSocket(payerSockets, paymentLinkId, socket.id);
+    socket.paymentLinkId = paymentLinkId;
+    console.log(`Payer watching payment: ${paymentLinkId}`);
+  });
+
+  // Merchant registers for notifications. The dashboard sends
+  // its login token, so nobody else can subscribe to the
+  // merchant's payment notifications.
+  socket.on("register-merchant", (token) => {
+    try {
+      verifyAdminToken(token);
+    } catch {
+      socket.emit("register-error", "Session expired. Please sign in.");
+      return;
+    }
+
+    addSocket(merchantSockets, MERCHANT_ID, socket.id);
+    socket.userId = MERCHANT_ID;
+    console.log(`Merchant registered: ${MERCHANT_ID}`);
+  });
+
+  socket.on("disconnect", () => {
+    if (socket.paymentLinkId) {
+      removeSocket(payerSockets, socket.paymentLinkId, socket.id);
+    }
+    if (socket.userId) {
+      removeSocket(merchantSockets, socket.userId, socket.id);
+    }
+  });
+});
+
+// Make io accessible to routes
+app.set("io", io);
+app.set("payerSockets", payerSockets);
+app.set("merchantSockets", merchantSockets);
+
+notificationService.init(app);
+
+// --------------------------------------------------
+// 13. Start the server
 // --------------------------------------------------
 
 const port = Number(process.env.PORT || 5001);
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(
-    `PayLink API listening on port ${port}`
-  );
+server.listen(port, "0.0.0.0", () => {
+  console.log(`PayLink v2 server running on http://localhost:${port}`);
 });
